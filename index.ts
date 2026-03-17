@@ -1123,11 +1123,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       }
     },
     resolveModel: (modelRef, providerHint) => {
-      const raw =
-        (modelRef?.trim() ||
-         envSnapshot.pluginSummaryModel ||
-         envSnapshot.lcmSummaryModel ||
-         envSnapshot.openclawDefaultModel).trim();
+      const raw = (modelRef?.trim() || envSnapshot.openclawDefaultModel).trim();
       if (!raw) {
         throw new Error("No model configured for LCM summarization.");
       }
@@ -1140,13 +1136,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         }
       }
 
-      const provider = (
-        providerHint?.trim() ||
-        envSnapshot.pluginSummaryProvider ||
-        envSnapshot.lcmSummaryProvider ||
-        envSnapshot.openclawProvider ||
-        "openai"
-      ).trim();
+      const provider = (providerHint?.trim() || envSnapshot.openclawProvider || "openai").trim();
       return { provider, model: raw };
     },
     getApiKey: async (provider, model, options) => {
@@ -1164,7 +1154,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
             return modelAuthKey;
           }
         } catch {
-          // Fall through to auth-profile lookup for older OpenClaw runtimes.
+          // Fall through to env/auth-profile lookup for older OpenClaw runtimes.
         }
       }
 
@@ -1178,8 +1168,11 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       return resolveApiKeyFromAuthProfiles({
         provider,
         authProfileId: options?.profileId,
-        agentDir: api.resolvePath("."),
-        runtimeConfig: api.config,
+        agentDir:
+          typeof options?.agentDir === "string" && options.agentDir.trim()
+            ? options.agentDir.trim()
+            : api.resolvePath("."),
+        runtimeConfig: options?.runtimeConfig ?? api.config,
         piAiModule: mod,
         envSnapshot,
       });
@@ -1200,7 +1193,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
               return modelAuthKey;
             }
           } catch {
-            // Fall through to auth-profile lookup for older OpenClaw runtimes.
+            // Fall through to env/auth-profile lookup for older OpenClaw runtimes.
           }
         }
 
@@ -1214,8 +1207,11 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         return resolveApiKeyFromAuthProfiles({
           provider,
           authProfileId: options?.profileId,
-          agentDir: api.resolvePath("."),
-          runtimeConfig: api.config,
+          agentDir:
+            typeof options?.agentDir === "string" && options.agentDir.trim()
+              ? options.agentDir.trim()
+              : api.resolvePath("."),
+          runtimeConfig: options?.runtimeConfig ?? api.config,
           piAiModule: mod,
           envSnapshot,
         });

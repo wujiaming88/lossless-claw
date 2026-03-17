@@ -642,15 +642,89 @@ export async function createLcmSummarizeFromLegacyParams(params: {
   legacyParams: LcmSummarizerLegacyParams;
   customInstructions?: string;
 }): Promise<LcmSummarizeFn | undefined> {
+  const readModelRef = (value: unknown): string => {
+    if (typeof value === "string") {
+      return value.trim();
+    }
+    const primary = (value as { primary?: unknown } | undefined)?.primary;
+    return typeof primary === "string" ? primary.trim() : "";
+  };
+
+  const runtimeConfig =
+    params.legacyParams.config && typeof params.legacyParams.config === "object"
+      ? (params.legacyParams.config as {
+          agents?: {
+            defaults?: {
+              compaction?: {
+                model?: unknown;
+              };
+            };
+          };
+          plugins?: {
+            entries?: {
+              [key: string]: {
+                config?: { summaryModel?: unknown; summaryProvider?: unknown };
+              };
+            };
+          };
+        })
+      : undefined;
+
+  const nestedPluginConfig = runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config;
+
+  const summaryLevels = [
+    {
+      levelName: "plugin config (lossless-claw)",
+      model: readModelRef(nestedPluginConfig?.summaryModel),
+      provider: typeof nestedPluginConfig?.summaryProvider === "string" ? nestedPluginConfig.summaryProvider.trim() : "",
+    },
+    {
+      levelName: "environment variables",
+      model: process.env.LCM_SUMMARY_MODEL?.trim() ?? "",
+      provider: process.env.LCM_SUMMARY_PROVIDER?.trim() ?? "",
+    },
+    {
+      levelName: "OpenClaw agents.defaults.compaction.model",
+      model: readModelRef(runtimeConfig?.agents?.defaults?.compaction?.model),
+      provider: "",
+    },
+  ];
+
+  let resolvedSummary: { model: string; provider: string | undefined } | undefined;
+  for (const level of summaryLevels) {
+    if (!level.model) continue;
+    if (level.model.includes("/")) {
+      resolvedSummary = { model: level.model, provider: undefined };
+      break;
+    }
+    if (level.provider) {
+      resolvedSummary = { model: level.model, provider: level.provider };
+      break;
+    }
+    params.deps.log.warn(
+      `[lcm] summaryModel "${level.model}" at "${level.levelName}" has no summaryProvider or provider prefix. Will attempt resolution without provider.`
+    );
+    resolvedSummary = { model: level.model, provider: undefined };
+    break;
+  }
+
   const providerHint =
     typeof params.legacyParams.provider === "string" ? params.legacyParams.provider.trim() : "";
   const modelHint =
     typeof params.legacyParams.model === "string" ? params.legacyParams.model.trim() : "";
-  const modelRef = modelHint || undefined;
+  const modelRef = resolvedSummary?.model || modelHint || undefined;
+
+  const resolveProviderHint =
+    resolvedSummary !== undefined
+      ? (
+          resolvedSummary.provider ||
+          (!resolvedSummary.model.includes("/") ? (providerHint || undefined) : undefined)
+        )
+      : (providerHint || undefined);
 
   let resolved: { provider: string; model: string };
   try {
-    resolved = params.deps.resolveModel(modelRef, providerHint || undefined);
+    resolved = params.deps.resolveModel(modelRef, resolveProviderHint);
   } catch (err) {
     console.error(`[lcm] createLcmSummarize: resolveModel FAILED:`, err instanceof Error ? err.message : err);
     return undefined;
@@ -691,6 +765,8 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     const isCondensed = options?.isCondensed === true;
     const apiKey = await params.deps.getApiKey(provider, model, {
       profileId: authProfileId,
+      agentDir,
+      runtimeConfig: params.legacyParams.config,
     });
     const targetTokens = resolveTargetTokens({
       inputTokens: estimateTokens(text),

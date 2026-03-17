@@ -20,6 +20,8 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       largeFileTokenThreshold: 25_000,
       largeFileSummaryProvider: "",
       largeFileSummaryModel: "",
+      summaryModel: "",
+      summaryProvider: "",
       autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
@@ -55,6 +57,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
 describe("createLcmSummarizeFromLegacyParams", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it("returns undefined when model resolution fails", async () => {
@@ -73,6 +76,180 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         },
       }),
     ).resolves.toBeUndefined();
+  });
+
+  it("plugin summaryProvider alone (no summaryModel) is ignored and falls back to legacy provider", async () => {
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        config: {
+          plugins: {
+            entries: {
+              "lossless-claw": { config: { summaryProvider: "openai-resp" } },
+            },
+          },
+        },
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("claude-opus-4-5", "anthropic");
+  });
+
+  it("prefers plugin summaryModel over env and compaction model", async () => {
+    vi.stubEnv("LCM_SUMMARY_MODEL", "gpt-4o-mini");
+    vi.stubEnv("LCM_SUMMARY_PROVIDER", "openai-resp");
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        config: {
+          agents: {
+            defaults: {
+              compaction: {
+                model: "openai-resp/gpt-4.1-mini",
+              },
+            },
+          },
+          plugins: {
+            entries: {
+              "lossless-claw": { config: { summaryModel: "gpt-4.1", summaryProvider: "qiniu" } },
+            },
+          },
+        },
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4.1", "qiniu");
+  });
+
+  it("prefers env summaryModel over compaction model and session model", async () => {
+    vi.stubEnv("LCM_SUMMARY_MODEL", "gpt-4o-mini");
+    vi.stubEnv("LCM_SUMMARY_PROVIDER", "openai-resp");
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        config: {
+          agents: {
+            defaults: {
+              compaction: {
+                model: "openai-resp/gpt-4.1-mini",
+              },
+            },
+          },
+        },
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4o-mini", "openai-resp");
+  });
+
+  it("uses OpenClaw compaction model before session model", async () => {
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        config: {
+          agents: {
+            defaults: {
+              compaction: {
+                model: "openai-resp/gpt-4.1-mini",
+              },
+            },
+          },
+        },
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("openai-resp/gpt-4.1-mini", undefined);
+  });
+
+  it("supports compaction model objects with primary", async () => {
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        config: {
+          agents: {
+            defaults: {
+              compaction: {
+                model: { primary: "openai-resp/gpt-4.1-mini" },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("openai-resp/gpt-4.1-mini", undefined);
+  });
+
+  it("plugin summaryModel without provider and no slash emits warning but still resolves", async () => {
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        config: {
+          plugins: {
+            entries: {
+              "lossless-claw": { config: { summaryModel: "gpt-4o-mini" } },
+            },
+          },
+        },
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4o-mini", "anthropic");
+    expect(vi.mocked(deps.log.warn)).toHaveBeenCalledWith(expect.stringContaining("gpt-4o-mini"));
+  });
+
+  it("env summaryModel without summaryProvider falls back to the legacy provider hint", async () => {
+    vi.stubEnv("LCM_SUMMARY_MODEL", "gpt-4o-mini");
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "openai-resp",
+        model: "gpt-5.4",
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4o-mini", "openai-resp");
+    expect(vi.mocked(deps.log.warn)).toHaveBeenCalledWith(expect.stringContaining("gpt-4o-mini"));
+  });
+
+  it("falls back to legacy providerHint when no summary overrides exist", async () => {
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("claude-opus-4-5", "anthropic");
   });
 
   it("builds distinct normal vs aggressive prompts", async () => {
@@ -150,6 +327,27 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     const completeMock = vi.mocked(deps.complete);
     expect(completeMock.mock.calls[0]?.[0]?.apiKey).toBe("resolved-api-key");
+  });
+
+  it("passes authProfileId through to getApiKey", async () => {
+    const deps = makeDeps({
+      getApiKey: vi.fn(() => "resolved-api-key"),
+    });
+
+    const summarize = await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        authProfileId: "profile-123",
+      },
+    });
+
+    await summarize!("Summary input");
+
+    expect(vi.mocked(deps.getApiKey)).toHaveBeenCalledWith("anthropic", "claude-opus-4-5", {
+      profileId: "profile-123",
+    });
   });
 
   it("falls back deterministically when model returns empty summary output after retry", async () => {

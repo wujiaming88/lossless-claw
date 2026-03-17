@@ -61,6 +61,12 @@ function safeString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
 function safeBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
@@ -1287,6 +1293,9 @@ export class LcmContextEngine implements ContextEngine {
     autoCompactionSummary?: string;
     isHeartbeat?: boolean;
     tokenBudget?: number;
+    /** OpenClaw runtime param name (preferred). */
+    runtimeContext?: Record<string, unknown>;
+    /** Back-compat param name. */
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
     this.ensureMigrated();
@@ -1325,6 +1334,8 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
+    const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
+
     const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
 
     try {
@@ -1335,7 +1346,7 @@ export class LcmContextEngine implements ContextEngine {
           sessionFile: params.sessionFile,
           tokenBudget,
           currentTokenCount: liveContextTokens,
-          legacyParams: params.legacyCompactionParams,
+          legacyParams,
         }).catch(() => {
           // Leaf compaction is best-effort and should not fail the caller.
         });
@@ -1351,7 +1362,7 @@ export class LcmContextEngine implements ContextEngine {
         tokenBudget,
         currentTokenCount: liveContextTokens,
         compactionTarget: "threshold",
-        legacyParams: params.legacyCompactionParams,
+        legacyParams,
       });
     } catch {
       // Proactive compaction is best-effort in the post-turn lifecycle.
@@ -1464,6 +1475,9 @@ export class LcmContextEngine implements ContextEngine {
     tokenBudget?: number;
     currentTokenCount?: number;
     customInstructions?: string;
+    /** OpenClaw runtime param name (preferred). */
+    runtimeContext?: Record<string, unknown>;
+    /** Back-compat param name. */
     legacyParams?: Record<string, unknown>;
     force?: boolean;
     previousSummaryContent?: string;
@@ -1481,7 +1495,12 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
-      const tokenBudget = this.resolveTokenBudget(params);
+      const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
+
+      const tokenBudget = this.resolveTokenBudget({
+        tokenBudget: params.tokenBudget,
+        legacyParams,
+      });
       if (!tokenBudget) {
         return {
           ok: false,
@@ -1490,7 +1509,7 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
-      const lp = params.legacyParams ?? {};
+      const lp = legacyParams ?? {};
       const observedTokens = this.normalizeObservedTokenCount(
         params.currentTokenCount ??
           (
@@ -1500,7 +1519,7 @@ export class LcmContextEngine implements ContextEngine {
           ).currentTokenCount,
       );
       const summarize = await this.resolveSummarize({
-        legacyParams: params.legacyParams,
+        legacyParams,
         customInstructions: params.customInstructions,
       });
 
@@ -1537,6 +1556,9 @@ export class LcmContextEngine implements ContextEngine {
     currentTokenCount?: number;
     compactionTarget?: "budget" | "threshold";
     customInstructions?: string;
+    /** OpenClaw runtime param name (preferred). */
+    runtimeContext?: Record<string, unknown>;
+    /** Back-compat param name. */
     legacyParams?: Record<string, unknown>;
     /** Force compaction even if below threshold */
     force?: boolean;
@@ -1557,7 +1579,8 @@ export class LcmContextEngine implements ContextEngine {
 
       const conversationId = conversation.conversationId;
 
-      const lp = params.legacyParams ?? {};
+      const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
+      const lp = legacyParams ?? {};
       const manualCompactionRequested =
         (
           lp as {
@@ -1565,7 +1588,10 @@ export class LcmContextEngine implements ContextEngine {
           }
         ).manualCompaction === true;
       const forceCompaction = force || manualCompactionRequested;
-      const tokenBudget = this.resolveTokenBudget(params);
+      const tokenBudget = this.resolveTokenBudget({
+        tokenBudget: params.tokenBudget,
+        legacyParams,
+      });
       if (!tokenBudget) {
         return {
           ok: false,
@@ -1575,7 +1601,7 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       const summarize = await this.resolveSummarize({
-        legacyParams: params.legacyParams,
+        legacyParams,
         customInstructions: params.customInstructions,
       });
 

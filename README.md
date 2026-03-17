@@ -121,10 +121,27 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File blocks above this size are intercepted and stored separately |
 | `LCM_LARGE_FILE_SUMMARY_PROVIDER` | `""` | Provider override for large-file summarization |
 | `LCM_LARGE_FILE_SUMMARY_MODEL` | `""` | Model override for large-file summarization |
-| `LCM_SUMMARY_MODEL` | *(from OpenClaw)* | Model for summarization (e.g. `anthropic/claude-sonnet-4-20250514`) |
-| `LCM_SUMMARY_PROVIDER` | *(from OpenClaw)* | Provider override for summarization |
+| `LCM_SUMMARY_MODEL` | *(from OpenClaw)* | Model for summarization (e.g. `anthropic/claude-sonnet-4-20250514` or `claude-sonnet-4-20250514`) |
+| `LCM_SUMMARY_PROVIDER` | *(from OpenClaw)* | Provider used with a bare `LCM_SUMMARY_MODEL` value when you want to override the session provider |
 | `LCM_AUTOCOMPACT_DISABLED` | `false` | Disable automatic compaction after turns |
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
+
+### Summary model priority
+
+When choosing which model to use for summarization, lossless-claw follows this priority order (highest to lowest):
+
+1. Plugin config `summaryModel` (from `plugins.entries.lossless-claw.config.summaryModel`)
+2. Environment variable `LCM_SUMMARY_MODEL`
+3. OpenClaw's `agents.defaults.compaction.model` (if configured)
+4. Current session model (inherited from the active conversation)
+5. OpenClaw's `agents.defaults.model.primary` (system default)
+
+`summaryProvider` is not an independent selector. It is only used when the chosen `summaryModel` is a bare model name without a provider prefix. If no explicit `summaryProvider` is configured for that level, lossless-claw falls back to the active session provider hint and emits a warning.
+
+This allows you to:
+- Set a global summarization model via plugin config or environment variable
+- Reuse OpenClaw's compaction model configuration when available
+- Fall back gracefully to session or system defaults when nothing is explicitly configured
 
 ### Recommended starting configuration
 
