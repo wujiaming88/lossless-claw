@@ -121,6 +121,9 @@ describe("lcm plugin registration", () => {
       incrementalMaxDepth: -1,
       freshTailCount: 7,
       dbPath,
+      ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
+      statelessSessionPatterns: ["agent:*:subagent:**"],
+      skipStatelessSessions: true,
       largeFileThresholdTokens: 12345,
     });
 
@@ -136,10 +139,22 @@ describe("lcm plugin registration", () => {
       incrementalMaxDepth: -1,
       freshTailCount: 7,
       databasePath: dbPath,
+      ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
+      statelessSessionPatterns: ["agent:*:subagent:**"],
+      skipStatelessSessions: true,
       largeFileTokenThreshold: 12345,
     });
     expect(infoLog).toHaveBeenCalledWith(
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:**, agent:main:subagent:**",
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Stateless session patterns: 1 pattern(s): agent:*:subagent:**",
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Compaction summarization model: (unconfigured)",
     );
   });
 
@@ -184,6 +199,30 @@ describe("lcm plugin registration", () => {
     });
   });
 
+  it("uses plugin config model override when summaryModel is set", () => {
+    const { api, getFactory } = buildApi({
+      enabled: true,
+      summaryModel: "gpt-5.4",
+      summaryProvider: "openai-resp",
+    });
+    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as { deps?: { resolveModel: (modelRef?: string, providerHint?: string) => unknown } };
+    const resolved = engine.deps?.resolveModel(undefined, undefined) as
+      | { provider: string; model: string }
+      | undefined;
+
+    expect(resolved).toEqual({
+      provider: "openai-resp",
+      model: "gpt-5.4",
+    });
+  });
+
   it("forwards explicit provider and model fields to runtime subagent runs", async () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
@@ -225,6 +264,95 @@ describe("lcm plugin registration", () => {
       provider: "openrouter",
       model: "anthropic/claude-haiku-4-5",
     }));
+  });
+
+  it("prefers env summary overrides over plugin config model overrides", () => {
+    vi.stubEnv("LCM_SUMMARY_PROVIDER", "anthropic");
+    vi.stubEnv("LCM_SUMMARY_MODEL", "claude-3-5-haiku");
+    const { api, getFactory } = buildApi({
+      enabled: true,
+      summaryModel: "gpt-5.4",
+      summaryProvider: "openai-resp",
+    });
+    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as { deps?: { resolveModel: (modelRef?: string, providerHint?: string) => unknown } };
+    const resolved = engine.deps?.resolveModel(undefined, undefined) as
+      | { provider: string; model: string }
+      | undefined;
+
+    expect(resolved).toEqual({
+      provider: "anthropic",
+      model: "claude-3-5-haiku",
+    });
+  });
+
+  it("uses plugin config model with provider/model format", () => {
+    const { api, getFactory } = buildApi({
+      enabled: true,
+      summaryModel: "openai-resp/gpt-5.4",
+    });
+    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as { deps?: { resolveModel: (modelRef?: string, providerHint?: string) => unknown } };
+    const resolved = engine.deps?.resolveModel(undefined, undefined) as
+      | { provider: string; model: string }
+      | undefined;
+
+    expect(resolved).toEqual({
+      provider: "openai-resp",
+      model: "gpt-5.4",
+    });
+  });
+
+  it("keeps explicit provider hints ahead of plugin summaryProvider", () => {
+    const { api, getFactory } = buildApi({
+      enabled: true,
+      summaryModel: "gpt-5.4",
+      summaryProvider: "openai-resp",
+    });
+
+    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as { deps?: { resolveModel: (modelRef?: string, providerHint?: string) => unknown } };
+    const resolved = engine.deps?.resolveModel("claude-sonnet-4-6", "anthropic") as
+      | { provider: string; model: string }
+      | undefined;
+
+    expect(resolved).toEqual({
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+    });
+  });
+
+  it("logs compaction summarization overrides at startup", () => {
+    const { api, infoLog } = buildApi({
+      enabled: true,
+      summaryModel: "gpt-5.4",
+      summaryProvider: "openai-resp",
+    });
+    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Compaction summarization model: openai-resp/gpt-5.4 (override)",
+    );
   });
 
   it("registers without runtime.modelAuth on older OpenClaw runtimes", () => {

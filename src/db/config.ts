@@ -4,6 +4,12 @@ import { join } from "path";
 export type LcmConfig = {
   enabled: boolean;
   databasePath: string;
+  /** Glob patterns for session keys to exclude from LCM storage entirely. */
+  ignoreSessionPatterns: string[];
+  /** Glob patterns for session keys that may read from LCM but never write to it. */
+  statelessSessionPatterns: string[];
+  /** When true, stateless session pattern matching is enforced. */
+  skipStatelessSessions: boolean;
   contextThreshold: number;
   freshTailCount: number;
   leafMinFanout: number;
@@ -15,6 +21,10 @@ export type LcmConfig = {
   condensedTargetTokens: number;
   maxExpandTokens: number;
   largeFileTokenThreshold: number;
+  /** Provider override for compaction summarization. */
+  summaryProvider: string;
+  /** Model override for compaction summarization. */
+  summaryModel: string;
   /** Provider override for large-file text summarization. */
   largeFileSummaryProvider: string;
   /** Model override for large-file text summarization. */
@@ -61,6 +71,24 @@ function toStr(value: unknown): string | undefined {
   return undefined;
 }
 
+/** Coerce a plugin config value into a trimmed string array when possible. */
+function toStrArray(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) {
+    const normalized = value
+      .map((entry) => toStr(entry))
+      .filter((entry): entry is string => typeof entry === "string");
+    return normalized.length > 0 ? normalized : [];
+  }
+  const single = toStr(value);
+  if (!single) {
+    return undefined;
+  }
+  return single
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
 /**
  * Resolve LCM configuration with three-tier precedence:
  *   1. Environment variables (highest — backward compat)
@@ -83,6 +111,24 @@ export function resolveLcmConfig(
       ?? toStr(pc.dbPath)
       ?? toStr(pc.databasePath)
       ?? join(homedir(), ".openclaw", "lcm.db"),
+    ignoreSessionPatterns:
+      env.LCM_IGNORE_SESSION_PATTERNS !== undefined
+        ? env.LCM_IGNORE_SESSION_PATTERNS
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+        : toStrArray(pc.ignoreSessionPatterns) ?? [],
+    statelessSessionPatterns:
+      env.LCM_STATELESS_SESSION_PATTERNS !== undefined
+        ? env.LCM_STATELESS_SESSION_PATTERNS
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+        : toStrArray(pc.statelessSessionPatterns) ?? [],
+    skipStatelessSessions:
+      env.LCM_SKIP_STATELESS_SESSIONS !== undefined
+        ? env.LCM_SKIP_STATELESS_SESSIONS === "true"
+        : toBool(pc.skipStatelessSessions) ?? true,
     contextThreshold:
       (env.LCM_CONTEXT_THRESHOLD !== undefined ? parseFloat(env.LCM_CONTEXT_THRESHOLD) : undefined)
         ?? toNumber(pc.contextThreshold) ?? 0.75,
@@ -118,14 +164,14 @@ export function resolveLcmConfig(
         ?? toNumber(pc.largeFileThresholdTokens)
         ?? toNumber(pc.largeFileTokenThreshold)
         ?? 25000,
+    summaryProvider:
+      env.LCM_SUMMARY_PROVIDER?.trim() ?? toStr(pc.summaryProvider) ?? "",
+    summaryModel:
+      env.LCM_SUMMARY_MODEL?.trim() ?? toStr(pc.summaryModel) ?? "",
     largeFileSummaryProvider:
       env.LCM_LARGE_FILE_SUMMARY_PROVIDER?.trim() ?? toStr(pc.largeFileSummaryProvider) ?? "",
     largeFileSummaryModel:
       env.LCM_LARGE_FILE_SUMMARY_MODEL?.trim() ?? toStr(pc.largeFileSummaryModel) ?? "",
-    summaryModel:
-      env.LCM_SUMMARY_MODEL?.trim() ?? toStr(pc.summaryModel) ?? "",
-    summaryProvider:
-      env.LCM_SUMMARY_PROVIDER?.trim() ?? toStr(pc.summaryProvider) ?? "",
     expansionProvider:
       env.LCM_EXPANSION_PROVIDER?.trim() ?? toStr(pc.expansionProvider) ?? "",
     expansionModel:

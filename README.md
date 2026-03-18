@@ -94,7 +94,12 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
         "config": {
           "freshTailCount": 32,
           "contextThreshold": 0.75,
-          "incrementalMaxDepth": -1
+          "incrementalMaxDepth": -1,
+          "ignoreSessionPatterns": [
+            "agent:*:cron:**"
+          ],
+          "summaryProvider": "anthropic",
+          "summaryModel": "claude-3-5-haiku"
         }
       }
     }
@@ -102,12 +107,17 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 }
 ```
 
+`summaryModel` and `summaryProvider` let you pin compaction summarization to a cheaper or faster model than your main OpenClaw session model. When unset, LCM uses OpenClaw's configured default model/provider.
+
 ### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LCM_ENABLED` | `true` | Enable/disable the plugin |
 | `LCM_DATABASE_PATH` | `~/.openclaw/lcm.db` | Path to the SQLite database |
+| `LCM_IGNORE_SESSION_PATTERNS` | `""` | Comma-separated glob patterns for session keys to exclude from LCM storage |
+| `LCM_STATELESS_SESSION_PATTERNS` | `""` | Comma-separated glob patterns for session keys that may read from LCM but never write to it |
+| `LCM_SKIP_STATELESS_SESSIONS` | `true` | Enable stateless-session write skipping for matching session keys |
 | `LCM_CONTEXT_THRESHOLD` | `0.75` | Fraction of context window that triggers compaction (0.0–1.0) |
 | `LCM_FRESH_TAIL_COUNT` | `32` | Number of recent messages protected from compaction |
 | `LCM_LEAF_MIN_FANOUT` | `8` | Minimum raw messages per leaf summary |
@@ -121,8 +131,8 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File blocks above this size are intercepted and stored separately |
 | `LCM_LARGE_FILE_SUMMARY_PROVIDER` | `""` | Provider override for large-file summarization |
 | `LCM_LARGE_FILE_SUMMARY_MODEL` | `""` | Model override for large-file summarization |
-| `LCM_SUMMARY_MODEL` | *(from OpenClaw)* | Model for summarization (e.g. `anthropic/claude-sonnet-4-20250514` or `claude-sonnet-4-20250514`) |
-| `LCM_SUMMARY_PROVIDER` | *(from OpenClaw)* | Provider used with a bare `LCM_SUMMARY_MODEL` value when you want to override the session provider |
+| `LCM_SUMMARY_MODEL` | `""` | Model override for compaction summarization; falls back to OpenClaw's default model when unset |
+| `LCM_SUMMARY_PROVIDER` | `""` | Provider override for compaction summarization; falls back to `OPENCLAW_PROVIDER` or the provider embedded in the model ref |
 | `LCM_EXPANSION_MODEL` | *(from OpenClaw)* | Model override for `lcm_expand_query` sub-agent (e.g. `anthropic/claude-haiku-4-5`) |
 | `LCM_EXPANSION_PROVIDER` | *(from OpenClaw)* | Provider override for `lcm_expand_query` sub-agent |
 | `LCM_AUTOCOMPACT_DISABLED` | `false` | Disable automatic compaction after turns |
@@ -161,23 +171,26 @@ Add a `subagent` policy under `plugins.entries.lossless-claw` and allowlist the 
 - The chosen expansion target must also be available in OpenClaw's normal model catalog. If it is not already configured elsewhere, add it under the top-level `models` map as shown above.
 - If you prefer splitting provider and model, set `config.expansionProvider` and use a bare `config.expansionModel`.
 
+Plugin config equivalents:
+
+- `ignoreSessionPatterns`
+- `statelessSessionPatterns`
+- `skipStatelessSessions`
+- `summaryModel`
+- `summaryProvider`
+
+Environment variables still win over plugin config when both are set.
+
 ### Summary model priority
 
-When choosing which model to use for summarization, lossless-claw follows this priority order (highest to lowest):
+For compaction summarization, lossless-claw resolves the model in this order:
 
-1. Plugin config `summaryModel` (from `plugins.entries.lossless-claw.config.summaryModel`)
-2. Environment variable `LCM_SUMMARY_MODEL`
-3. OpenClaw's `agents.defaults.compaction.model` (if configured)
-4. Legacy call-site model hint (`params.legacyParams.model`) if none of the explicit config sources above provide a summary model
+1. `LCM_SUMMARY_MODEL` / `LCM_SUMMARY_PROVIDER`
+2. Plugin config `summaryModel` / `summaryProvider`
+3. OpenClaw's default compaction model/provider
+4. Legacy per-call model/provider hints
 
-`summaryProvider` is not an independent selector. It is only used when the chosen `summaryModel` is a bare model name without a provider prefix. If no explicit `summaryProvider` is configured at the same level, lossless-claw falls back to the legacy call-site provider hint (`params.legacyParams.provider`) and emits a warning.
-
-After that, OpenClaw's normal `resolveModel(...)` behavior still applies, so inherited session or system defaults may be used only if the earlier sources did not fully resolve the model.
-
-This allows you to:
-- Set a global summarization model via plugin config or environment variable
-- Reuse OpenClaw's compaction model configuration when available
-- Fall back to legacy call-site hints, then to OpenClaw's normal session or system defaults when nothing more explicit is configured
+If `summaryModel` already includes a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that choice. Otherwise, the provider falls back to the matching override, then `OPENCLAW_PROVIDER`, then the provider inferred by the caller.
 
 ### Recommended starting configuration
 
@@ -190,6 +203,87 @@ LCM_CONTEXT_THRESHOLD=0.75
 - **freshTailCount=32** protects the last 32 messages from compaction, giving the model enough recent context for continuity.
 - **incrementalMaxDepth=-1** enables unlimited automatic condensation after each compaction pass — the DAG cascades as deep as needed. Set to `0` (default) for leaf-only, or a positive integer for a specific depth cap.
 - **contextThreshold=0.75** triggers compaction when context reaches 75% of the model's window, leaving headroom for the model's response.
+
+### Session exclusion patterns
+
+Use `ignoreSessionPatterns` or `LCM_IGNORE_SESSION_PATTERNS` to keep low-value sessions completely out of LCM. Matching sessions do not create conversations, do not store messages, and do not participate in compaction or delegated expansion grants.
+
+Pattern rules:
+
+- `*` matches any characters except `:`
+- `**` matches anything, including `:`
+- Patterns match the full session key
+
+Examples:
+
+- `agent:*:cron:**` excludes cron sessions for any agent, including isolated run sessions like `agent:main:cron:daily-digest:run:run-123`
+- `agent:main:subagent:**` excludes all main-agent subagent sessions
+- `agent:ops:**` excludes every session under the `ops` agent id
+
+Environment variable example:
+
+```bash
+LCM_IGNORE_SESSION_PATTERNS=agent:*:cron:**,agent:main:subagent:**
+```
+
+Plugin config example:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "lossless-claw": {
+        "config": {
+          "ignoreSessionPatterns": [
+            "agent:*:cron:**",
+            "agent:main:subagent:**"
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+### Stateless session patterns
+
+Use `statelessSessionPatterns` or `LCM_STATELESS_SESSION_PATTERNS` for sessions that should still be able to read from existing LCM context, but should never create or mutate LCM state themselves. This is useful for delegated or temporary sub-agent sessions that should benefit from retained context without polluting the database.
+
+When `skipStatelessSessions` or `LCM_SKIP_STATELESS_SESSIONS` is enabled, matching sessions:
+
+- skip bootstrap imports
+- skip message persistence during ingest and after-turn hooks
+- skip compaction writes and delegated expansion grant writes
+- can still assemble context from already-persisted conversations when a matching conversation exists
+
+Pattern rules are the same as `ignoreSessionPatterns`, and matching is done against the full session key.
+
+Environment variable example:
+
+```bash
+LCM_STATELESS_SESSION_PATTERNS=agent:*:subagent:**,agent:ops:subagent:**
+LCM_SKIP_STATELESS_SESSIONS=true
+```
+
+Plugin config example:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "lossless-claw": {
+        "config": {
+          "statelessSessionPatterns": [
+            "agent:*:subagent:**",
+            "agent:ops:subagent:**"
+          ],
+          "skipStatelessSessions": true
+        }
+      }
+    }
+  }
+}
+```
 
 ### OpenClaw session reset settings
 

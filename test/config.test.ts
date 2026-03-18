@@ -6,12 +6,17 @@ describe("resolveLcmConfig", () => {
   it("uses hardcoded defaults when no env or plugin config", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.enabled).toBe(true);
+    expect(config.ignoreSessionPatterns).toEqual([]);
+    expect(config.statelessSessionPatterns).toEqual([]);
+    expect(config.skipStatelessSessions).toBe(true);
     expect(config.contextThreshold).toBe(0.75);
     expect(config.freshTailCount).toBe(32);
     expect(config.incrementalMaxDepth).toBe(0);
     expect(config.leafMinFanout).toBe(8);
     expect(config.condensedMinFanout).toBe(4);
     expect(config.condensedMinFanoutHard).toBe(2);
+    expect(config.summaryProvider).toBe("");
+    expect(config.summaryModel).toBe("");
     expect(config.autocompactDisabled).toBe(false);
     expect(config.pruneHeartbeatOk).toBe(false);
   });
@@ -21,6 +26,9 @@ describe("resolveLcmConfig", () => {
       contextThreshold: 0.5,
       freshTailCount: 16,
       incrementalMaxDepth: -1,
+      ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
+      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+      skipStatelessSessions: false,
       leafMinFanout: 4,
       condensedMinFanout: 2,
       autocompactDisabled: true,
@@ -28,6 +36,12 @@ describe("resolveLcmConfig", () => {
       enabled: false,
     });
     expect(config.enabled).toBe(false);
+    expect(config.ignoreSessionPatterns).toEqual([
+      "agent:*:cron:*",
+      "agent:main:subagent:**",
+    ]);
+    expect(config.statelessSessionPatterns).toEqual(["agent:*:ephemeral:**"]);
+    expect(config.skipStatelessSessions).toBe(false);
     expect(config.contextThreshold).toBe(0.5);
     expect(config.freshTailCount).toBe(16);
     expect(config.incrementalMaxDepth).toBe(-1);
@@ -44,16 +58,31 @@ describe("resolveLcmConfig", () => {
       LCM_INCREMENTAL_MAX_DEPTH: "3",
       LCM_ENABLED: "false",
       LCM_AUTOCOMPACT_DISABLED: "true",
+      LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
+      LCM_STATELESS_SESSION_PATTERNS: "agent:*:ephemeral:**, agent:main:preview:*",
+      LCM_SKIP_STATELESS_SESSIONS: "false",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
       contextThreshold: 0.5,
       freshTailCount: 16,
       incrementalMaxDepth: -1,
+      ignoreSessionPatterns: ["agent:*:test:*"],
+      statelessSessionPatterns: ["agent:*:preview:*"],
+      skipStatelessSessions: true,
       enabled: true,
       autocompactDisabled: false,
     };
     const config = resolveLcmConfig(env, pluginConfig);
     expect(config.enabled).toBe(false); // env wins
+    expect(config.ignoreSessionPatterns).toEqual([
+      "agent:*:cron:*",
+      "agent:main:subagent:**",
+    ]);
+    expect(config.statelessSessionPatterns).toEqual([
+      "agent:*:ephemeral:**",
+      "agent:main:preview:*",
+    ]);
+    expect(config.skipStatelessSessions).toBe(false);
     expect(config.contextThreshold).toBe(0.9); // env wins
     expect(config.freshTailCount).toBe(64); // env wins
     expect(config.incrementalMaxDepth).toBe(3); // env wins
@@ -80,9 +109,21 @@ describe("resolveLcmConfig", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: "0.6",
       freshTailCount: "24",
+      ignoreSessionPatterns: "agent:*:cron:*, agent:main:subagent:**",
+      statelessSessionPatterns: "agent:*:ephemeral:**, agent:main:preview:*",
+      skipStatelessSessions: "false",
     });
     expect(config.contextThreshold).toBe(0.6);
     expect(config.freshTailCount).toBe(24);
+    expect(config.ignoreSessionPatterns).toEqual([
+      "agent:*:cron:*",
+      "agent:main:subagent:**",
+    ]);
+    expect(config.statelessSessionPatterns).toEqual([
+      "agent:*:ephemeral:**",
+      "agent:main:preview:*",
+    ]);
+    expect(config.skipStatelessSessions).toBe(false);
   });
 
   it("ignores invalid plugin config values", () => {
@@ -153,6 +194,70 @@ describe("resolveLcmConfig", () => {
     );
     expect(config.expansionModel).toBe("anthropic/claude-sonnet-4-6");
     expect(config.expansionProvider).toBe("openrouter");
+  });
+
+  it("keeps empty ignore session patterns out of resolved config", () => {
+    const config = resolveLcmConfig(
+      { LCM_IGNORE_SESSION_PATTERNS: " agent:*:cron:* , , " } as NodeJS.ProcessEnv,
+      {
+        ignoreSessionPatterns: ["agent:*:test:*"],
+      },
+    );
+
+    expect(config.ignoreSessionPatterns).toEqual(["agent:*:cron:*"]);
+  });
+
+  it("keeps empty stateless session patterns out of resolved config", () => {
+    const config = resolveLcmConfig(
+      { LCM_STATELESS_SESSION_PATTERNS: " agent:*:ephemeral:** , , " } as NodeJS.ProcessEnv,
+      {
+        statelessSessionPatterns: ["agent:*:preview:*"],
+      },
+    );
+
+    expect(config.statelessSessionPatterns).toEqual(["agent:*:ephemeral:**"]);
+  });
+
+  it("uses summary model overrides from env vars", () => {
+    const config = resolveLcmConfig({
+      LCM_SUMMARY_PROVIDER: "anthropic",
+      LCM_SUMMARY_MODEL: "claude-3-5-haiku",
+    } as NodeJS.ProcessEnv, {});
+
+    expect(config.summaryProvider).toBe("anthropic");
+    expect(config.summaryModel).toBe("claude-3-5-haiku");
+  });
+
+  it("uses summary model overrides from plugin config when env vars are absent", () => {
+    const config = resolveLcmConfig({}, {
+      summaryProvider: "openai",
+      summaryModel: "gpt-5-mini",
+    });
+
+    expect(config.summaryProvider).toBe("openai");
+    expect(config.summaryModel).toBe("gpt-5-mini");
+  });
+
+  it("prefers env summary overrides over plugin config", () => {
+    const config = resolveLcmConfig({
+      LCM_SUMMARY_PROVIDER: "anthropic",
+      LCM_SUMMARY_MODEL: "claude-3-5-haiku",
+    } as NodeJS.ProcessEnv, {
+      summaryProvider: "openai",
+      summaryModel: "gpt-5-mini",
+    });
+
+    expect(config.summaryProvider).toBe("anthropic");
+    expect(config.summaryModel).toBe("claude-3-5-haiku");
+  });
+
+  it("defaults summary overrides to empty strings when unset", () => {
+    const config = resolveLcmConfig({}, {
+      freshTailCount: 16,
+    });
+
+    expect(config.summaryProvider).toBe("");
+    expect(config.summaryModel).toBe("");
   });
 
   it("ships a manifest that accepts unlimited incremental depth", () => {
