@@ -414,6 +414,79 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(summary).toContain("[LCM fallback summary; truncated for context management]");
   });
 
+  it("falls back deterministically when the initial summarizer call times out", async () => {
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const deps = makeDeps({
+        complete: vi.fn(
+          () =>
+            new Promise(() => {
+              // Intentionally unresolved to exercise the timeout fallback path.
+            }),
+        ),
+      });
+
+      const summarizeResult = await createLcmSummarizeFromLegacyParams({
+        deps,
+        legacyParams: {
+          provider: "anthropic",
+          model: "claude-opus-4-5",
+        },
+      });
+      const summarize =
+        typeof summarizeResult === "function"
+          ? summarizeResult
+          : (summarizeResult as { fn?: (typeof summarizeResult extends { fn: infer T } ? T : never) })?.fn;
+
+      vi.useFakeTimers();
+      const summaryPromise = summarize!("A".repeat(12_000), false);
+      await vi.advanceTimersByTimeAsync(60_000);
+      const summary = await summaryPromise;
+
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+      expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+      expect(vi.getTimerCount()).toBe(0);
+
+      const diagnostics = [
+        ...consoleWarn.mock.calls.flatMap((call) => call.map((entry) => String(entry))),
+        ...consoleError.mock.calls.flatMap((call) => call.map((entry) => String(entry))),
+      ].join(" ");
+      expect(diagnostics).toContain("summarizer timed out");
+      expect(diagnostics).toContain("timeout=60000ms");
+      expect(diagnostics).toContain("source=fallback");
+    } finally {
+      consoleWarn.mockRestore();
+      consoleError.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears the summarizer timeout timer after a successful completion", async () => {
+    try {
+      const deps = makeDeps();
+      const summarizeResult = await createLcmSummarizeFromLegacyParams({
+        deps,
+        legacyParams: {
+          provider: "anthropic",
+          model: "claude-opus-4-5",
+        },
+      });
+      const summarize =
+        typeof summarizeResult === "function"
+          ? summarizeResult
+          : (summarizeResult as { fn?: (typeof summarizeResult extends { fn: infer T } ? T : never) })?.fn;
+
+      vi.useFakeTimers();
+      const summary = await summarize!("Summary input", false);
+
+      expect(summary).toBe("summary output");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("normalizes OpenAI output_text and reasoning summary blocks", async () => {
     const deps = makeDeps({
       resolveModel: vi.fn(() => ({
@@ -576,7 +649,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     });
 
     it("falls back gracefully when retry throws an exception", async () => {
-      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
       try {
         let callCount = 0;
         const deps = makeDeps({
@@ -604,13 +677,13 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         // Retry threw → deterministic fallback.
         expect(summary).toContain("[LCM fallback summary; truncated for context management]");
 
-        const diagnostics = consoleError.mock.calls
+        const diagnostics = consoleWarn.mock.calls
           .flatMap((c) => c.map(String))
           .join(" ");
         expect(diagnostics).toContain("retry failed");
         expect(diagnostics).toContain("rate limit exceeded");
       } finally {
-        consoleError.mockRestore();
+        consoleWarn.mockRestore();
       }
     });
 

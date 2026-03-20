@@ -32,6 +32,31 @@ const DIAGNOSTIC_MAX_CHARS = 1200;
 const DIAGNOSTIC_SENSITIVE_KEY_PATTERN =
   /(api[-_]?key|authorization|token|secret|password|cookie|set-cookie|private[-_]?key|bearer)/i;
 
+/**
+ * Default timeout for a single summarizer LLM call.  Long enough for large
+ * context windows on slower providers, short enough to prevent the gateway
+ * event loop from starving when a provider hangs.
+ */
+const SUMMARIZER_TIMEOUT_MS = 60_000;
+
+/** Error used to distinguish summarizer timeouts from provider failures. */
+class SummarizerTimeoutError extends Error {
+  constructor(ms: number, label: string) {
+    super(`[lcm] summarizer timeout after ${ms}ms (${label})`);
+    this.name = "SummarizerTimeoutError";
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new SummarizerTimeoutError(ms, label)), ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
 /** Normalize provider ids for stable config/profile lookup. */
 function normalizeProviderId(provider: string): string {
   return provider.trim().toLowerCase();
@@ -795,7 +820,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
     let result: Awaited<ReturnType<typeof params.deps.complete>>;
     try {
-      result = await params.deps.complete({
+      result = await withTimeout(params.deps.complete({
         provider,
         model,
         apiKey,
@@ -812,11 +837,19 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         ],
         maxTokens: targetTokens,
         temperature: aggressive ? 0.1 : 0.2,
-      });
+      }), SUMMARIZER_TIMEOUT_MS, "initial");
     } catch (err) {
-      console.error(
-        `[lcm] summarizer call failed; provider=${provider}; model=${model}; error=${err instanceof Error ? err.message : String(err)}`,
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const isTimeout = errMsg.includes("summarizer timeout");
+      console.warn(
+        `[lcm] summarizer ${isTimeout ? "timed out" : "failed"}; provider=${provider}; model=${model}; timeout=${SUMMARIZER_TIMEOUT_MS}ms; error=${errMsg}`,
       );
+      if (err instanceof SummarizerTimeoutError) {
+        console.error(
+          `[lcm] summarizer timed out; provider=${provider}; model=${model}; source=fallback`,
+        );
+        return buildDeterministicFallbackSummary(text, targetTokens);
+      }
       return "";
     }
 
@@ -859,7 +892,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       // reasoning budget to coax a textual response from providers that
       // sometimes return reasoning-only or empty blocks on the first pass.
       try {
-        const retryResult = await params.deps.complete({
+        const retryResult = await withTimeout(params.deps.complete({
           provider,
           model,
           apiKey,
@@ -877,7 +910,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           maxTokens: targetTokens,
           temperature: 0.05,
           reasoning: "low",
-        });
+        }), SUMMARIZER_TIMEOUT_MS, "retry");
 
         const retryNormalized = normalizeCompletionSummary(retryResult.content);
         summary = retryNormalized.summary;
@@ -904,10 +937,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         }
       } catch (retryErr) {
         // Retry is best-effort; log and proceed to deterministic fallback.
-        console.error(
-          `[lcm] retry failed; provider=${provider} model=${model}; error=${
-            retryErr instanceof Error ? retryErr.message : String(retryErr)
-          }; falling back to truncation`,
+        const retryErrMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        const isRetryTimeout = retryErrMsg.includes("summarizer timeout");
+        console.warn(
+          `[lcm] retry ${isRetryTimeout ? "timed out" : "failed"}; provider=${provider}; model=${model}; timeout=${SUMMARIZER_TIMEOUT_MS}ms; error=${retryErrMsg}; falling back to truncation`,
         );
       }
     }
