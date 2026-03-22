@@ -62,6 +62,15 @@ type doctorSummarizer interface {
 	summarize(ctx context.Context, prompt string, targetTokens int) (string, error)
 }
 
+// oauthCLISummarizer delegates to the claude CLI for OAuth/setup-token auth.
+type oauthCLISummarizer struct {
+	model string
+}
+
+func (o *oauthCLISummarizer) summarize(ctx context.Context, prompt string, targetTokens int) (string, error) {
+	return summarizeViaCLI(ctx, o.model, prompt, targetTokens)
+}
+
 // runDoctorCommand scans for genuinely truncated summaries and optionally rewrites them.
 func runDoctorCommand(args []string) error {
 	opts, conversationID, hasConversationID, err := parseDoctorArgs(args)
@@ -112,18 +121,28 @@ func runDoctorCommand(args []string) error {
 		fmt.Println("Mode: dry-run (transaction rolled back after preview)")
 	}
 
-	apiKey, err := resolveProviderAPIKey(paths, opts.provider)
-	if err != nil {
-		return err
+	// Check if Anthropic is configured with OAuth/token mode — delegate to claude CLI.
+	var summarizer doctorSummarizer
+	if opts.provider == "anthropic" {
+		mode, _ := readProviderProfileMode(paths.openclawConfig, "anthropic")
+		if mode == "token" || mode == "oauth" {
+			summarizer = &oauthCLISummarizer{model: opts.model}
+		}
 	}
-	client := &anthropicClient{
-		provider: opts.provider,
-		apiKey:   apiKey,
-		http:     &http.Client{Timeout: defaultHTTPTimeout},
-		model:    opts.model,
+	if summarizer == nil {
+		apiKey, err := resolveProviderAPIKey(paths, opts.provider)
+		if err != nil {
+			return err
+		}
+		summarizer = &anthropicClient{
+			provider: opts.provider,
+			apiKey:   apiKey,
+			http:     &http.Client{Timeout: defaultHTTPTimeout},
+			model:    opts.model,
+		}
 	}
 
-	rewritten, err := executeDoctorPlan(ctx, db, plan, opts, client)
+	rewritten, err := executeDoctorPlan(ctx, db, plan, opts, summarizer)
 	if err != nil {
 		return err
 	}
