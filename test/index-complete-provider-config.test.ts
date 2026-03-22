@@ -107,18 +107,17 @@ async function callComplete(params: {
   };
 
   try {
-    await engine.deps.complete({
+    const result = await engine.deps.complete({
       provider: params.provider,
       model: params.model,
       runtimeConfig: params.runtimeConfig,
       messages: [{ role: "user", content: "Summarize this." }],
       maxTokens: 256,
     });
+    return { loadConfig, result };
   } finally {
     closeLcmConnection(engine.config.databasePath);
   }
-
-  return { loadConfig };
 }
 
 describe("createLcmDependencies.complete provider config resolution", () => {
@@ -258,5 +257,31 @@ describe("createLcmDependencies.complete provider config resolution", () => {
       expect.any(Object),
       expect.any(Object),
     );
+  });
+
+  it("preserves provider auth error metadata when completeSimple throws a 401 scope error", async () => {
+    piAiMock.completeSimple.mockRejectedValue({
+      statusCode: 401,
+      error: {
+        code: "insufficient_scope",
+        message: "Missing required scope: model.request",
+      },
+    });
+
+    const { result } = await callComplete({
+      loadConfigResult: {},
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      runtimeConfig: {},
+    });
+
+    expect(result).toMatchObject({
+      content: [],
+      error: {
+        kind: "provider_auth",
+        statusCode: 401,
+        code: "insufficient_scope",
+      },
+    });
   });
 });
