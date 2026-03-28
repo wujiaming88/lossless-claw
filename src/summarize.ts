@@ -1038,18 +1038,21 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const model = candidate.model;
       const authProfileId = candidate.useLegacyAuthProfile ? legacyAuthProfileId : undefined;
       const providerApi = resolveProviderApiFromLegacyConfig(params.legacyParams.config, provider);
-      const apiKey = await params.deps.getApiKey(provider, model, {
+      const lookupOptions = {
         profileId: authProfileId,
         agentDir,
         runtimeConfig: params.legacyParams.config,
-      });
+      };
 
-      let result: Awaited<ReturnType<typeof params.deps.complete>>;
-      try {
-        result = await withTimeout(params.deps.complete({
+      const runSummarizerCall = async (
+        requestApiKey: string | undefined,
+        label: string,
+        reasoning?: string,
+      ) =>
+        withTimeout(params.deps.complete({
           provider,
           model,
-          apiKey,
+          apiKey: requestApiKey,
           providerApi,
           authProfileId,
           agentDir,
@@ -1062,12 +1065,91 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             },
           ],
           maxTokens: targetTokens,
-        }), SUMMARIZER_TIMEOUT_MS, "initial");
+          ...(reasoning ? { reasoning } : {}),
+        }), SUMMARIZER_TIMEOUT_MS, label);
+
+      const retryWithoutModelAuth = async (
+        failure: ProviderAuthFailure,
+        reasoning?: string,
+      ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
+        const initialAuthError = new LcmProviderAuthError({ provider, model, failure });
+        console.warn(initialAuthError.message);
+        console.warn(
+          `[lcm] summarizer auth retry: retrying ${provider}/${model} without runtime.modelAuth credentials.`,
+        );
+
+        const directApiKey = await params.deps.getApiKey(provider, model, {
+          ...lookupOptions,
+          skipModelAuth: true,
+        });
+        if (!directApiKey) {
+          console.warn(
+            `[lcm] summarizer auth retry unavailable: no direct credentials found for ${provider}/${model}.`,
+          );
+          throw initialAuthError;
+        }
+
+        try {
+          const directResult = await runSummarizerCall(directApiKey, "auth-retry", reasoning);
+          const directFailure = extractProviderAuthFailure(directResult);
+          if (directFailure) {
+            const retryAuthError = new LcmProviderAuthError({
+              provider,
+              model,
+              failure: directFailure,
+            });
+            console.warn(retryAuthError.message);
+            throw retryAuthError;
+          }
+          console.warn(
+            `[lcm] summarizer auth retry succeeded; provider=${provider}; model=${model}; source=direct-credentials`,
+          );
+          return directResult;
+        } catch (directErr) {
+          if (directErr instanceof LcmProviderAuthError) {
+            throw directErr;
+          }
+          const directFailure = extractProviderAuthFailure(directErr);
+          if (directFailure) {
+            const retryAuthError = new LcmProviderAuthError({
+              provider,
+              model,
+              failure: directFailure,
+            });
+            console.warn(retryAuthError.message);
+            throw retryAuthError;
+          }
+          throw directErr;
+        }
+      };
+
+      const attemptSummarizerCall = async (
+        label: string,
+        reasoning?: string,
+      ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
+        const apiKey = await params.deps.getApiKey(provider, model, lookupOptions);
+        try {
+          const result = await runSummarizerCall(apiKey, label, reasoning);
+          const authFailure = extractProviderAuthFailure(result);
+          if (!authFailure) {
+            return result;
+          }
+          return retryWithoutModelAuth(authFailure, reasoning);
+        } catch (err) {
+          const authFailure = extractProviderAuthFailure(err);
+          if (!authFailure) {
+            throw err;
+          }
+          return retryWithoutModelAuth(authFailure, reasoning);
+        }
+      };
+
+      let result: Awaited<ReturnType<typeof params.deps.complete>>;
+      try {
+        result = await attemptSummarizerCall("initial");
       } catch (err) {
-        const authFailure = extractProviderAuthFailure(err);
-        if (authFailure) {
-          lastAuthError = new LcmProviderAuthError({ provider, model, failure: authFailure });
-          console.warn(lastAuthError.message);
+        if (err instanceof LcmProviderAuthError) {
+          lastAuthError = err;
           if (index < resolvedCandidates.length - 1) {
             const nextCandidate = resolvedCandidates[index + 1]!;
             console.warn(
@@ -1089,20 +1171,6 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           return buildDeterministicFallbackSummary(text, targetTokens);
         }
         return "";
-      }
-
-      const authFailure = extractProviderAuthFailure(result);
-      if (authFailure) {
-        lastAuthError = new LcmProviderAuthError({ provider, model, failure: authFailure });
-        console.warn(lastAuthError.message);
-        if (index < resolvedCandidates.length - 1) {
-          const nextCandidate = resolvedCandidates[index + 1]!;
-          console.warn(
-            `[lcm] summarizer auth fallback: retrying with ${nextCandidate.provider}/${nextCandidate.model} after ${provider}/${model} failed auth.`,
-          );
-          continue;
-        }
-        throw lastAuthError;
       }
 
       const normalized = normalizeCompletionSummary(result.content);
@@ -1144,38 +1212,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         // reasoning budget to coax a textual response from providers that
         // sometimes return reasoning-only or empty blocks on the first pass.
         try {
-          const retryResult = await withTimeout(params.deps.complete({
-            provider,
-            model,
-            apiKey,
-            providerApi,
-            authProfileId,
-            agentDir,
-            runtimeConfig: params.legacyParams.config,
-            system: LCM_SUMMARIZER_SYSTEM_PROMPT,
-            messages: [
-              {
-                role: "user",
-                content: prompt,
-              },
-            ],
-            maxTokens: targetTokens,
-            reasoning: "low",
-          }), SUMMARIZER_TIMEOUT_MS, "retry");
-          const retryAuthFailure = extractProviderAuthFailure(retryResult);
-          if (retryAuthFailure) {
-            lastAuthError = new LcmProviderAuthError({ provider, model, failure: retryAuthFailure });
-            console.warn(lastAuthError.message);
-            if (index < resolvedCandidates.length - 1) {
-              const nextCandidate = resolvedCandidates[index + 1]!;
-              console.warn(
-                `[lcm] summarizer auth fallback: retrying with ${nextCandidate.provider}/${nextCandidate.model} after ${provider}/${model} failed auth.`,
-              );
-              continue;
-            }
-            throw lastAuthError;
-          }
-
+          const retryResult = await attemptSummarizerCall("retry", "low");
           const retryNormalized = normalizeCompletionSummary(retryResult.content);
           summary = retryNormalized.summary;
 
@@ -1201,12 +1238,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           }
         } catch (retryErr) {
           if (retryErr instanceof LcmProviderAuthError) {
-            throw retryErr;
-          }
-          const retryAuthFailure = extractProviderAuthFailure(retryErr);
-          if (retryAuthFailure) {
-            lastAuthError = new LcmProviderAuthError({ provider, model, failure: retryAuthFailure });
-            console.warn(lastAuthError.message);
+            lastAuthError = retryErr;
             if (index < resolvedCandidates.length - 1) {
               const nextCandidate = resolvedCandidates[index + 1]!;
               console.warn(

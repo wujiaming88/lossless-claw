@@ -72,6 +72,7 @@ export type ApiKeyLookupOptions = {
   preferredProfile?: string;
   agentDir?: string;
   runtimeConfig?: unknown;
+  skipModelAuth?: boolean;
 };
 
 export type GetApiKeyFn = (
