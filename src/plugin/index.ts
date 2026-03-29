@@ -1037,6 +1037,64 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
     api.logger.warn(buildLegacyAuthFallbackWarning());
   }
 
+  /** Resolve the best config object to hand to runtime.modelAuth for this lookup. */
+  const resolveModelAuthConfig = (runtimeConfig: unknown): OpenClawPluginApi["config"] => {
+    if (runtimeConfig && typeof runtimeConfig === "object") {
+      return runtimeConfig as OpenClawPluginApi["config"];
+    }
+    return api.config;
+  };
+
+  /** Resolve an API key without throwing so summarizer auth fallback can retry safely. */
+  const lookupApiKey = async (
+    provider: string,
+    model: string,
+    options?: {
+      profileId?: string;
+      preferredProfile?: string;
+      agentDir?: string;
+      runtimeConfig?: unknown;
+      skipModelAuth?: boolean;
+    },
+  ): Promise<string | undefined> => {
+    const modelAuthConfig = resolveModelAuthConfig(options?.runtimeConfig);
+
+    if (modelAuth && options?.skipModelAuth !== true) {
+      try {
+        const modelAuthKey = resolveApiKeyFromAuthResult(
+          await modelAuth.getApiKeyForModel({
+            model: buildModelAuthLookupModel({ provider, model }),
+            cfg: modelAuthConfig,
+            ...(options?.profileId ? { profileId: options.profileId } : {}),
+            ...(options?.preferredProfile ? { preferredProfile: options.preferredProfile } : {}),
+          }),
+        );
+        if (modelAuthKey) {
+          return modelAuthKey;
+        }
+      } catch {
+        // Fall through to env/auth-profile lookup for older or scope-limited runtimes.
+      }
+    }
+
+    const envKey = resolveApiKey(provider, readEnv);
+    if (envKey) {
+      return envKey;
+    }
+
+    const piAiModuleId = "@mariozechner/pi-ai";
+    const mod = (await import(piAiModuleId)) as PiAiModule;
+    return resolveApiKeyFromAuthProfiles({
+      provider,
+      authProfileId: options?.profileId,
+      agentDir: options?.agentDir ?? api.resolvePath("."),
+      runtimeConfig: options?.runtimeConfig,
+      appConfig: api.config,
+      piAiModule: mod,
+      envSnapshot,
+    });
+  };
+
   return {
     config,
     complete: async ({
@@ -1349,76 +1407,10 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       return { provider, model: raw };
     },
     getApiKey: async (provider, model, options) => {
-      if (modelAuth) {
-        try {
-          const modelAuthKey = resolveApiKeyFromAuthResult(
-            await modelAuth.getApiKeyForModel({
-              model: buildModelAuthLookupModel({ provider, model }),
-              cfg: api.config,
-              ...(options?.profileId ? { profileId: options.profileId } : {}),
-              ...(options?.preferredProfile ? { preferredProfile: options.preferredProfile } : {}),
-            }),
-          );
-          if (modelAuthKey) {
-            return modelAuthKey;
-          }
-        } catch {
-          // Fall through to auth-profile lookup for older OpenClaw runtimes.
-        }
-      }
-
-      const envKey = resolveApiKey(provider, readEnv);
-      if (envKey) {
-        return envKey;
-      }
-
-      const piAiModuleId = "@mariozechner/pi-ai";
-      const mod = (await import(piAiModuleId)) as PiAiModule;
-      return resolveApiKeyFromAuthProfiles({
-        provider,
-        authProfileId: options?.profileId,
-        agentDir: api.resolvePath("."),
-        runtimeConfig: api.config,
-        piAiModule: mod,
-        envSnapshot,
-      });
+      return lookupApiKey(provider, model, options);
     },
     requireApiKey: async (provider, model, options) => {
-      const key = await (async () => {
-        if (modelAuth) {
-          try {
-            const modelAuthKey = resolveApiKeyFromAuthResult(
-              await modelAuth.getApiKeyForModel({
-                model: buildModelAuthLookupModel({ provider, model }),
-                cfg: api.config,
-                ...(options?.profileId ? { profileId: options.profileId } : {}),
-                ...(options?.preferredProfile ? { preferredProfile: options.preferredProfile } : {}),
-              }),
-            );
-            if (modelAuthKey) {
-              return modelAuthKey;
-            }
-          } catch {
-            // Fall through to auth-profile lookup for older OpenClaw runtimes.
-          }
-        }
-
-        const envKey = resolveApiKey(provider, readEnv);
-        if (envKey) {
-          return envKey;
-        }
-
-        const piAiModuleId = "@mariozechner/pi-ai";
-        const mod = (await import(piAiModuleId)) as PiAiModule;
-        return resolveApiKeyFromAuthProfiles({
-          provider,
-          authProfileId: options?.profileId,
-          agentDir: api.resolvePath("."),
-          runtimeConfig: api.config,
-          piAiModule: mod,
-          envSnapshot,
-        });
-      })();
+      const key = await lookupApiKey(provider, model, options);
       if (!key) {
         throw new Error(`Missing API key for provider '${provider}' (model '${model}').`);
       }

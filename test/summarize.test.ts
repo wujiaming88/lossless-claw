@@ -219,6 +219,46 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("openai-resp/gpt-4.1-mini", undefined);
   });
 
+  it("uses OpenClaw default model before the runtime session model when no summary override exists", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn((modelRef?: string, providerHint?: string) => {
+        if (modelRef === "anthropic/claude-sonnet-4-6") {
+          return { provider: "anthropic", model: "claude-sonnet-4-6" };
+        }
+        if (modelRef === "gpt-5.4") {
+          return { provider: providerHint ?? "openai-codex", model: "gpt-5.4" };
+        }
+        throw new Error(`unexpected modelRef: ${String(modelRef)}`);
+      }),
+      complete: vi.fn(async () => ({
+        content: [{ type: "text", text: "summary output" }],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "openai-codex",
+        model: "gpt-5.4",
+        config: {
+          agents: {
+            defaults: {
+              model: "anthropic/claude-sonnet-4-6",
+            },
+          },
+        },
+      },
+    });
+
+    await summarize!("hello world", false);
+
+    expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).toMatchObject({
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+    });
+  });
+
   it("supports compaction model objects with primary", async () => {
     const deps = makeDeps();
 
@@ -611,7 +651,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
   // --- Empty-summary hardening: focused tests ---
 
   describe("empty-summary retry and diagnostics", () => {
-    it("skips retry and fallback when the provider returns an auth error envelope", async () => {
+    it("does not enter conservative retry/fallback when the provider returns an auth error envelope", async () => {
       const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
       try {
@@ -638,12 +678,13 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         await expect(result!.fn("A".repeat(8_000), false)).rejects.toBeInstanceOf(
           LcmProviderAuthError,
         );
-        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
 
         const warningText = consoleWarn.mock.calls.flatMap((call) => call.map(String)).join(" ");
         expect(warningText).toContain("provider auth error (401 / missing model.request scope)");
         expect(warningText).toContain("Check that the configured summaryProvider has valid API credentials.");
         expect(warningText).toContain("Current: openai-codex/gpt-5.4");
+        expect(warningText).toContain("summarizer auth retry");
 
         const errorText = consoleError.mock.calls.flatMap((call) => call.map(String)).join(" ");
         expect(errorText).not.toContain("retrying with conservative settings");
@@ -654,7 +695,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       }
     });
 
-    it("skips retry and fallback when the completion call throws an auth error", async () => {
+    it("does not enter conservative retry/fallback when the completion call throws an auth error", async () => {
       const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
       try {
@@ -682,11 +723,12 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         await expect(result!.fn("B".repeat(8_000), false)).rejects.toBeInstanceOf(
           LcmProviderAuthError,
         );
-        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
 
         const warningText = consoleWarn.mock.calls.flatMap((call) => call.map(String)).join(" ");
         expect(warningText).toContain("provider auth error (401 / missing model.request scope)");
         expect(warningText).toContain("Current: openai-codex/gpt-5.4");
+        expect(warningText).toContain("summarizer auth retry");
 
         const errorText = consoleError.mock.calls.flatMap((call) => call.map(String)).join(" ");
         expect(errorText).not.toContain("summarizer call failed");
@@ -694,6 +736,220 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       } finally {
         consoleWarn.mockRestore();
         consoleError.mockRestore();
+      }
+    });
+
+    it("falls back to the next resolved model when the preferred model fails auth", async () => {
+      const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn((modelRef?: string, providerHint?: string) => {
+            if (modelRef === "gpt-5.4") {
+              return { provider: providerHint ?? "openai-codex", model: "gpt-5.4" };
+            }
+            if (modelRef === "anthropic/claude-sonnet-4-6") {
+              return { provider: "anthropic", model: "claude-sonnet-4-6" };
+            }
+            throw new Error(`unexpected modelRef: ${String(modelRef)}`);
+          }),
+          complete: vi.fn(async ({ provider }: { provider?: string }) => {
+            if (provider === "openai-codex") {
+              return {
+                content: [],
+                error: {
+                  kind: "provider_auth",
+                  statusCode: 401,
+                  message: "Missing required scope: model.request",
+                },
+              };
+            }
+            return {
+              content: [{ type: "text", text: "Recovered summary from fallback model." }],
+            };
+          }),
+        });
+
+        const summarize = await createSummarizeFn({
+          deps,
+          legacyParams: {
+            provider: "openai-codex",
+            model: "gpt-5.4",
+            config: {
+              plugins: {
+                entries: {
+                  "lossless-claw": {
+                    config: {
+                      summaryProvider: "openai-codex",
+                      summaryModel: "gpt-5.4",
+                    },
+                  },
+                },
+              },
+              agents: {
+                defaults: {
+                  model: "anthropic/claude-sonnet-4-6",
+                },
+              },
+            },
+          },
+        });
+
+        const summary = await summarize!("A".repeat(8_000), false);
+
+        expect(summary).toBe("Recovered summary from fallback model.");
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(3);
+        expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).toMatchObject({
+          provider: "openai-codex",
+          model: "gpt-5.4",
+        });
+        expect(vi.mocked(deps.complete).mock.calls[1]?.[0]).toMatchObject({
+          provider: "openai-codex",
+          model: "gpt-5.4",
+        });
+        expect(vi.mocked(deps.complete).mock.calls[2]?.[0]).toMatchObject({
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+        });
+
+        const warningText = consoleWarn.mock.calls.flatMap((call) => call.map(String)).join(" ");
+        expect(warningText).toContain("summarizer auth fallback");
+        expect(warningText).toContain("retrying with anthropic/claude-sonnet-4-6");
+      } finally {
+        consoleWarn.mockRestore();
+      }
+    });
+
+    it("retries the same model with direct credentials before falling back to another provider", async () => {
+      const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn((modelRef?: string, providerHint?: string) => {
+            if (modelRef === "gpt-5.4") {
+              return { provider: providerHint ?? "openai-codex", model: "gpt-5.4" };
+            }
+            if (modelRef === "anthropic/claude-sonnet-4-6") {
+              return { provider: "anthropic", model: "claude-sonnet-4-6" };
+            }
+            throw new Error(`unexpected modelRef: ${String(modelRef)}`);
+          }),
+          getApiKey: vi.fn(
+            async (
+              _provider: string,
+              _model: string,
+              options?: { skipModelAuth?: boolean },
+            ) => (options?.skipModelAuth ? "direct-key" : "scoped-token"),
+          ),
+          complete: vi.fn(async ({ provider, apiKey }: { provider?: string; apiKey?: string }) => {
+            if (provider === "openai-codex" && apiKey === "scoped-token") {
+              return {
+                content: [],
+                error: {
+                  kind: "provider_auth",
+                  statusCode: 401,
+                  message: "Missing required scope: model.request",
+                },
+              };
+            }
+            if (provider === "openai-codex" && apiKey === "direct-key") {
+              return {
+                content: [{ type: "text", text: "Recovered summary from direct credentials." }],
+              };
+            }
+            return {
+              content: [{ type: "text", text: "Should not hit provider fallback." }],
+            };
+          }),
+        });
+
+        const summarize = await createSummarizeFn({
+          deps,
+          legacyParams: {
+            provider: "openai-codex",
+            model: "gpt-5.4",
+            config: {
+              plugins: {
+                entries: {
+                  "lossless-claw": {
+                    config: {
+                      summaryProvider: "openai-codex",
+                      summaryModel: "gpt-5.4",
+                    },
+                  },
+                },
+              },
+              agents: {
+                defaults: {
+                  model: "anthropic/claude-sonnet-4-6",
+                },
+              },
+            },
+          },
+        });
+
+        const summary = await summarize!("A".repeat(8_000), false);
+
+        expect(summary).toBe("Recovered summary from direct credentials.");
+        expect(vi.mocked(deps.getApiKey)).toHaveBeenNthCalledWith(1, "openai-codex", "gpt-5.4", {
+          profileId: undefined,
+          agentDir: undefined,
+          runtimeConfig: {
+            plugins: {
+              entries: {
+                "lossless-claw": {
+                  config: {
+                    summaryProvider: "openai-codex",
+                    summaryModel: "gpt-5.4",
+                  },
+                },
+              },
+            },
+            agents: {
+              defaults: {
+                model: "anthropic/claude-sonnet-4-6",
+              },
+            },
+          },
+        });
+        expect(vi.mocked(deps.getApiKey)).toHaveBeenNthCalledWith(2, "openai-codex", "gpt-5.4", {
+          profileId: undefined,
+          agentDir: undefined,
+          runtimeConfig: {
+            plugins: {
+              entries: {
+                "lossless-claw": {
+                  config: {
+                    summaryProvider: "openai-codex",
+                    summaryModel: "gpt-5.4",
+                  },
+                },
+              },
+            },
+            agents: {
+              defaults: {
+                model: "anthropic/claude-sonnet-4-6",
+              },
+            },
+          },
+          skipModelAuth: true,
+        });
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+        expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).toMatchObject({
+          provider: "openai-codex",
+          model: "gpt-5.4",
+          apiKey: "scoped-token",
+        });
+        expect(vi.mocked(deps.complete).mock.calls[1]?.[0]).toMatchObject({
+          provider: "openai-codex",
+          model: "gpt-5.4",
+          apiKey: "direct-key",
+        });
+
+        const warningText = consoleWarn.mock.calls.flatMap((call) => call.map(String)).join(" ");
+        expect(warningText).toContain("summarizer auth retry");
+        expect(warningText).toContain("without runtime.modelAuth credentials");
+        expect(warningText).not.toContain("retrying with anthropic/claude-sonnet-4-6");
+      } finally {
+        consoleWarn.mockRestore();
       }
     });
 
