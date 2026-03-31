@@ -13,9 +13,11 @@ import {
   resolveRequesterConversationScopeId,
 } from "./lcm-expand-tool.delegation.js";
 import {
+  acquireExpansionConcurrencySlot,
   clearDelegatedExpansionContext,
   evaluateExpansionRecursionGuard,
   recordExpansionDelegationTelemetry,
+  releaseExpansionConcurrencySlot,
   resolveExpansionRequestId,
   resolveNextExpansionDepth,
   stampDelegatedExpansionContext,
@@ -444,34 +446,60 @@ export function createLcmExpandQueryTool(input: {
         });
       }
 
-      const conversationScope = await resolveLcmConversationScope({
-        lcm: input.lcm,
-        deps: input.deps,
-        sessionId: input.sessionId,
-        sessionKey: input.sessionKey,
-        params: p,
+      const originSessionKey = recursionCheck.originSessionKey || callerSessionKey || "main";
+      const concurrencyCheck = acquireExpansionConcurrencySlot({
+        originSessionKey,
+        requestId,
       });
-      let scopedConversationId = conversationScope.conversationId;
-      if (
-        !conversationScope.allConversations &&
-        scopedConversationId == null &&
-        callerSessionKey
-      ) {
-        scopedConversationId = await resolveRequesterConversationScopeId({
+      if (concurrencyCheck.blocked) {
+        recordExpansionDelegationTelemetry({
           deps: input.deps,
-          requesterSessionKey: callerSessionKey,
-          lcm: input.lcm,
+          component: "lcm_expand_query",
+          event: "block",
+          requestId,
+          sessionKey: callerSessionKey,
+          expansionDepth: recursionCheck.expansionDepth,
+          originSessionKey: concurrencyCheck.originSessionKey,
+          reason: concurrencyCheck.reason,
         });
-      }
-
-      if (!conversationScope.allConversations && scopedConversationId == null) {
         return jsonResult({
-          error:
-            "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
+          errorCode: concurrencyCheck.code,
+          error: concurrencyCheck.message,
+          requestId: concurrencyCheck.requestId,
+          expansionDepth: recursionCheck.expansionDepth,
+          originSessionKey: concurrencyCheck.originSessionKey,
+          reason: concurrencyCheck.reason,
         });
       }
 
       try {
+        const conversationScope = await resolveLcmConversationScope({
+          lcm: input.lcm,
+          deps: input.deps,
+          sessionId: input.sessionId,
+          sessionKey: input.sessionKey,
+          params: p,
+        });
+        let scopedConversationId = conversationScope.conversationId;
+        if (
+          !conversationScope.allConversations &&
+          scopedConversationId == null &&
+          callerSessionKey
+        ) {
+          scopedConversationId = await resolveRequesterConversationScopeId({
+            deps: input.deps,
+            requesterSessionKey: callerSessionKey,
+            lcm: input.lcm,
+          });
+        }
+
+        if (!conversationScope.allConversations && scopedConversationId == null) {
+          return jsonResult({
+            error:
+              "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
+          });
+        }
+
         const candidates = await resolveSummaryCandidates({
           lcm: input.lcm,
           explicitSummaryIds,
@@ -516,7 +544,6 @@ export function createLcmExpandQueryTool(input: {
           input.deps.parseAgentSessionKey(callerSessionKey)?.agentId,
         );
         const childExpansionDepth = resolveNextExpansionDepth(callerSessionKey);
-        const originSessionKey = recursionCheck.originSessionKey || callerSessionKey || "main";
 
         const task = buildDelegatedExpandQueryTask({
           summaryIds,
@@ -683,6 +710,11 @@ export function createLcmExpandQueryTool(input: {
         input.deps.log.error(`[lcm] delegated expansion query failed: ${failure}`);
         return jsonResult({
           error: failure,
+        });
+      } finally {
+        releaseExpansionConcurrencySlot({
+          originSessionKey,
+          requestId,
         });
       }
     },

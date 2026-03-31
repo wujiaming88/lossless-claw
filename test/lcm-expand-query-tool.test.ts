@@ -771,4 +771,117 @@ describe("createLcmExpandQueryTool", () => {
       success: 0,
     });
   });
+
+  it("blocks concurrent delegated expansion from the same origin session", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+
+    let releaseWait!: () => void;
+    const waitGate = new Promise<{ status: string }>((resolve) => {
+      releaseWait = () => resolve({ status: "ok" });
+    });
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        return { runId: `run-${callGatewayMock.mock.calls.length}` };
+      }
+      if (request.method === "agent.wait") {
+        return await waitGate;
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "Concurrent expansion resolved cleanly.",
+                    citedIds: ["sum_a"],
+                    expandedSummaryCount: 1,
+                    totalSourceTokens: 1200,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+
+    const firstPromise = tool.execute("call-concurrent-1", {
+      summaryIds: ["sum_a"],
+      prompt: "Answer while another expansion is running",
+      conversationId: 42,
+    });
+    const second = await tool.execute("call-concurrent-2", {
+      summaryIds: ["sum_a"],
+      prompt: "Should block until the first finishes",
+      conversationId: 42,
+    });
+
+    expect(second.details).toMatchObject({
+      errorCode: "EXPANSION_CONCURRENCY_BLOCKED",
+      reason: "origin_session_in_flight",
+      originSessionKey: "agent:main:main",
+    });
+    expect((second.details as { error?: string }).error).toContain(
+      "Another lcm_expand_query delegation is already in flight",
+    );
+    expect((second.details as { error?: string }).error).toContain(
+      "use `lcm_grep` or `lcm_describe` instead",
+    );
+
+    releaseWait();
+    const first = await firstPromise;
+    expect(first.details).toMatchObject({
+      answer: "Concurrent expansion resolved cleanly.",
+      citedIds: ["sum_a"],
+      sourceConversationId: 42,
+      expandedSummaryCount: 1,
+      totalSourceTokens: 1200,
+      truncated: false,
+    });
+
+    const third = await tool.execute("call-concurrent-3", {
+      summaryIds: ["sum_a"],
+      prompt: "Should succeed after the first request releases the slot",
+      conversationId: 42,
+    });
+    expect(third.details).toMatchObject({
+      answer: "Concurrent expansion resolved cleanly.",
+      citedIds: ["sum_a"],
+      sourceConversationId: 42,
+      expandedSummaryCount: 1,
+      totalSourceTokens: 1200,
+      truncated: false,
+    });
+
+    const agentCalls = callGatewayMock.mock.calls
+      .map(([opts]) => opts as { method?: string })
+      .filter((entry) => entry.method === "agent");
+    expect(agentCalls).toHaveLength(2);
+    expect(getExpansionDelegationTelemetrySnapshotForTests()).toMatchObject({
+      start: 3,
+      block: 1,
+      timeout: 0,
+      success: 2,
+    });
+  });
 });
