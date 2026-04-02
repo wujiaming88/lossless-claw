@@ -475,7 +475,9 @@ function contentFromParts(
 ): unknown {
   if (parts.length === 0) {
     if (role === "assistant") {
-      return fallbackContent ? [{ type: "text", text: fallbackContent }] : [];
+      // Never return an empty content array — providers like Anthropic
+      // reject messages where content has zero ContentBlock entries.
+      return [{ type: "text", text: fallbackContent || "" }];
     }
     if (role === "toolResult") {
       return [{ type: "text", text: fallbackContent }];
@@ -949,8 +951,24 @@ export class ContextAssembler {
       }
     }
 
+    // Drop assistant messages with completely empty content arrays.
+    // This can happen when all tool-call blocks were filtered out by
+    // filterNonFreshAssistantToolCalls or when the original message
+    // was stored without any parts or text.  Providers like Anthropic
+    // reject such messages with "content field is empty".
+    const nonEmptyMessages = rawMessages.filter((msg) => {
+      if (
+        msg?.role === "assistant" &&
+        Array.isArray(msg.content) &&
+        (msg.content as unknown[]).length === 0
+      ) {
+        return false;
+      }
+      return true;
+    });
+
     return {
-      messages: sanitizeToolUseResultPairing(rawMessages) as AgentMessage[],
+      messages: sanitizeToolUseResultPairing(nonEmptyMessages) as AgentMessage[],
       estimatedTokens,
       systemPromptAddition,
       stats: {
