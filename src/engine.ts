@@ -2087,6 +2087,60 @@ export class LcmContextEngine implements ContextEngine {
     return result;
   }
 
+  /**
+   * Remove messages from the batch that already exist in the DB for this session.
+   * Conservative replay detection: only strip a prefix when the incoming
+   * batch begins with the entire stored transcript for the session.
+   */
+  private async deduplicateAfterTurnBatch(
+    sessionId: string,
+    batch: AgentMessage[],
+  ): Promise<AgentMessage[]> {
+    if (batch.length === 0) return batch;
+
+    const conversation = await this.conversationStore.getConversationBySessionId(sessionId);
+    if (!conversation) return batch;
+
+    const conversationId = conversation.conversationId;
+    const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
+    if (!lastDbMessage) return batch;
+
+    // Fast path: if the first incoming message doesn't exist in the DB at all,
+    // the entire batch is genuinely new (the common, no-restart case).
+    const firstStored = toStoredMessage(batch[0]!);
+    const firstExists = await this.conversationStore.hasMessage(
+      conversationId,
+      firstStored.role,
+      firstStored.content,
+    );
+    if (!firstExists) return batch;
+
+    const storedMessageCount = await this.conversationStore.getMessageCount(conversationId);
+    if (storedMessageCount > batch.length) {
+      return batch;
+    }
+
+    // Replay path: after a gateway restart, afterTurn receives the full
+    // session history rebuilt from JSONL. Only trim when the incoming batch
+    // starts with the exact stored transcript in order.
+    const storedBatch = batch.map((m) => toStoredMessage(m));
+    const storedMessages = await this.conversationStore.getMessages(conversationId, {
+      limit: storedMessageCount,
+    });
+    for (let i = 0; i < storedMessageCount; i += 1) {
+      const storedConversationMessage = storedMessages[i]!;
+      const incomingMessage = storedBatch[i]!;
+      if (
+        messageIdentity(storedConversationMessage.role, storedConversationMessage.content) !==
+        messageIdentity(incomingMessage.role, incomingMessage.content)
+      ) {
+        return batch;
+      }
+    }
+
+    return batch.slice(storedMessageCount);
+  }
+
   private async ingestSingle(params: {
     sessionId: string;
     sessionKey?: string;
@@ -2252,11 +2306,17 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
+    // Dedup guard: prevent duplicate ingestion when gateway restart replays full history.
+    const dedupedBatch = await this.deduplicateAfterTurnBatch(params.sessionId, ingestBatch);
+    if (dedupedBatch.length === 0) {
+      return;
+    }
+
     try {
       await this.ingestBatch({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
-        messages: ingestBatch,
+        messages: dedupedBatch,
         isHeartbeat: params.isHeartbeat === true,
       });
     } catch (err) {
