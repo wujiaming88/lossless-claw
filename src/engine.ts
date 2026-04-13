@@ -1604,6 +1604,27 @@ export class LcmContextEngine implements ContextEngine {
     if (this.shouldApplyHotCacheHysteresis(telemetry)) {
       return "hot";
     }
+    if (
+      telemetry.lastObservedCacheBreakAt
+      && (
+        !telemetry.lastObservedCacheHitAt
+        || telemetry.lastObservedCacheBreakAt >= telemetry.lastObservedCacheHitAt
+      )
+    ) {
+      return "cold";
+    }
+    if (
+      telemetry.consecutiveColdObservations
+      >= this.config.cacheAwareCompaction.coldCacheObservationThreshold
+    ) {
+      return "cold";
+    }
+    if (telemetry.lastObservedCacheHitAt) {
+      return "hot";
+    }
+    if (telemetry.cacheState === "cold") {
+      return "unknown";
+    }
     return telemetry.cacheState;
   }
 
@@ -1875,6 +1896,17 @@ export class LcmContextEngine implements ContextEngine {
           ? now
           : existing?.lastCacheTouchAt ?? null
       );
+    const consecutiveColdObservations =
+      snapshot?.sawExplicitBreak
+        ? Math.max(
+          existing?.consecutiveColdObservations ?? 0,
+          this.config.cacheAwareCompaction.coldCacheObservationThreshold,
+        )
+        : snapshot?.cacheState === "hot"
+          ? 0
+          : snapshot?.cacheState === "cold"
+            ? (existing?.consecutiveColdObservations ?? 0) + 1
+            : existing?.consecutiveColdObservations ?? 0;
     const lastActivityBand = this.classifyDynamicLeafActivityBand({
       lastActivityBand: existing?.lastActivityBand,
       tokensAccumulatedSinceLeafCompaction,
@@ -1895,6 +1927,7 @@ export class LcmContextEngine implements ContextEngine {
           ? now
           : existing?.lastObservedCacheBreakAt ?? null,
       cacheState: snapshot?.cacheState ?? existing?.cacheState ?? "unknown",
+      consecutiveColdObservations,
       retention: snapshot?.retention ?? existing?.retention ?? null,
       lastLeafCompactionAt: existing?.lastLeafCompactionAt ?? null,
       turnsSinceLeafCompaction,
@@ -1910,7 +1943,7 @@ export class LcmContextEngine implements ContextEngine {
     );
     if (updated) {
       this.deps.log.debug(
-        `[lcm] compaction telemetry updated: conversation=${params.conversationId} cacheState=${updated.cacheState} cacheRead=${updated.lastObservedCacheRead ?? "null"} cacheWrite=${updated.lastObservedCacheWrite ?? "null"} retention=${updated.retention ?? "null"} lastApiCallAt=${updated.lastApiCallAt?.toISOString() ?? "null"} lastCacheTouchAt=${updated.lastCacheTouchAt?.toISOString() ?? "null"} provider=${updated.provider ?? "null"} model=${updated.model ?? "null"} turnsSinceLeafCompaction=${updated.turnsSinceLeafCompaction} tokensSinceLeafCompaction=${updated.tokensAccumulatedSinceLeafCompaction} activityBand=${updated.lastActivityBand} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"} tokenBudget=${params.tokenBudget ?? "null"}`,
+        `[lcm] compaction telemetry updated: conversation=${params.conversationId} cacheState=${updated.cacheState} coldObservationStreak=${updated.consecutiveColdObservations} cacheRead=${updated.lastObservedCacheRead ?? "null"} cacheWrite=${updated.lastObservedCacheWrite ?? "null"} retention=${updated.retention ?? "null"} lastApiCallAt=${updated.lastApiCallAt?.toISOString() ?? "null"} lastCacheTouchAt=${updated.lastCacheTouchAt?.toISOString() ?? "null"} provider=${updated.provider ?? "null"} model=${updated.model ?? "null"} turnsSinceLeafCompaction=${updated.turnsSinceLeafCompaction} tokensSinceLeafCompaction=${updated.tokensAccumulatedSinceLeafCompaction} activityBand=${updated.lastActivityBand} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"} tokenBudget=${params.tokenBudget ?? "null"}`,
       );
     }
     return updated;
@@ -1931,6 +1964,7 @@ export class LcmContextEngine implements ContextEngine {
       lastObservedCacheHitAt: existing?.lastObservedCacheHitAt ?? null,
       lastObservedCacheBreakAt: existing?.lastObservedCacheBreakAt ?? null,
       cacheState: existing?.cacheState ?? "unknown",
+      consecutiveColdObservations: existing?.consecutiveColdObservations ?? 0,
       retention: existing?.retention ?? null,
       lastLeafCompactionAt: new Date(),
       turnsSinceLeafCompaction: 0,
