@@ -5,6 +5,7 @@ import {
   blockFromPart,
   tokenizeText,
   scoreRelevance,
+  isThinkingOnlyContent,
 } from "../src/assembler.js";
 import type { MessagePartRecord } from "../src/store/conversation-store.js";
 
@@ -646,5 +647,67 @@ describe("scoreRelevance", () => {
     const direct = scoreRelevance("login page handler", "login");
     expect(score).toBeGreaterThan(0);
     expect(direct).toBeGreaterThan(0);
+  });
+});
+
+describe("isThinkingOnlyContent", () => {
+  it("returns false for empty content", () => {
+    expect(isThinkingOnlyContent([])).toBe(false);
+  });
+
+  it("returns true for content with only a thinking block", () => {
+    expect(
+      isThinkingOnlyContent([{ type: "thinking", thinking: "some reasoning" }]),
+    ).toBe(true);
+  });
+
+  it("returns true for content with only a redacted_thinking block", () => {
+    expect(
+      isThinkingOnlyContent([{ type: "redacted_thinking", data: "xxx" }]),
+    ).toBe(true);
+  });
+
+  it("returns true for content with only a reasoning block", () => {
+    expect(
+      isThinkingOnlyContent([{ type: "reasoning", text: "some reasoning" }]),
+    ).toBe(true);
+  });
+
+  it("returns true for content with mixed thinking/reasoning blocks only", () => {
+    expect(
+      isThinkingOnlyContent([
+        { type: "thinking", thinking: "step 1" },
+        { type: "redacted_thinking", data: "xxx" },
+        { type: "reasoning", text: "step 2" },
+      ]),
+    ).toBe(true);
+  });
+
+  it("returns false when content includes a text block", () => {
+    expect(
+      isThinkingOnlyContent([
+        { type: "thinking", thinking: "some reasoning" },
+        { type: "text", text: "visible output" },
+      ]),
+    ).toBe(false);
+  });
+
+  it("returns false when content includes a tool_use block", () => {
+    expect(
+      isThinkingOnlyContent([
+        { type: "thinking", thinking: "some reasoning" },
+        { type: "tool_use", id: "toolu_123", name: "read", input: {} },
+      ]),
+    ).toBe(false);
+  });
+
+  it("returns false for content with only a text block", () => {
+    expect(
+      isThinkingOnlyContent([{ type: "text", text: "hello" }]),
+    ).toBe(false);
+  });
+
+  it("returns false for non-object content items", () => {
+    expect(isThinkingOnlyContent([null as any, undefined as any])).toBe(false);
   });
 });

@@ -536,6 +536,28 @@ export function pickToolIsError(parts: MessagePartRecord[]): boolean | undefined
   return undefined;
 }
 
+// ── Thinking-only detection ─────────────────────────────────────────────────
+
+const THINKING_LIKE_TYPES = new Set(["thinking", "redacted_thinking", "reasoning"]);
+
+/**
+ * Returns true when every block in a content array is a thinking/reasoning
+ * block (including redacted_thinking).  Such messages carry no visible text
+ * or tool calls; downstream dropThinkingBlocks() would strip them all,
+ * leaving an empty content array that Bedrock rejects.
+ *
+ * @internal Exported for testing only.
+ */
+export function isThinkingOnlyContent(content: unknown[]): boolean {
+  if (content.length === 0) return false;
+  return content.every(
+    (block) =>
+      !!block &&
+      typeof block === "object" &&
+      THINKING_LIKE_TYPES.has((block as { type?: unknown }).type as string),
+  );
+}
+
 function extractToolCallId(block: { id?: unknown; call_id?: unknown }): string | null {
   if (typeof block.id === "string" && block.id.length > 0) {
     return block.id;
@@ -1039,12 +1061,18 @@ export class ContextAssembler {
     // tool-use-only turns are stored with content="" and zero message_parts,
     // or when filterNonFreshAssistantToolCalls strips all tool_use blocks.
     // Anthropic (and other providers) reject empty content arrays/strings.
+    //
+    // Also filter out assistant messages whose content consists entirely of
+    // thinking/reasoning blocks.  These carry no visible text or tool calls;
+    // when the downstream provider strips thinking blocks (dropThinkingBlocks)
+    // the message ends up with empty content, which Bedrock rejects with
+    // "ValidationException: content field is empty".
     const cleanedEntries = normalizedEntries.filter(
       (entry) =>
         !(
           entry.message?.role === "assistant" &&
           (Array.isArray(entry.message.content)
-            ? entry.message.content.length === 0
+            ? entry.message.content.length === 0 || isThinkingOnlyContent(entry.message.content)
             : !entry.message.content)
         ),
     );
